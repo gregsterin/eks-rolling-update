@@ -30,7 +30,7 @@ setup(
     url='https://github.com/gregsterin/eks-rolling-update',
     license_file='LICENSE',
     licence='Apache License, Version 2.0',
-    packages=['eksrollup'],
+    packages=find_packages(exclude=["tests"]),
     include_package_data=True,
     zip_safe=False,
     install_requires=[
