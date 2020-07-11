@@ -165,6 +165,9 @@ def drain_node(node_name):
     # If returncode is non-zero, raise a CalledProcessError.
     if result.returncode != 0:
         raise Exception("Node not drained properly. Exiting")
+    sleep_time = app_config['POST_DRAIN_SLEEP_SECONDS']
+    logger.info("Sleeping {} seconds after draining node...".format(sleep_time))
+    time.sleep(sleep_time)
 
 
 def k8s_nodes_ready(max_retry=app_config['GLOBAL_MAX_RETRY'], wait=app_config['GLOBAL_HEALTH_WAIT']):
