@@ -30,7 +30,7 @@ app_config = {
     'EXCLUDE_NODE_LABEL_KEYS': os.getenv('EXCLUDE_NODE_LABEL_KEYS', 'spotinst.io/node-lifecycle').split(),
     'EXTRA_DRAIN_ARGS': os.getenv('EXTRA_DRAIN_ARGS', '').split(),
     'MAX_ALLOWABLE_NODE_AGE': int(os.getenv('MAX_ALLOWABLE_NODE_AGE', 6)),
-    'POST_DRAIN_SLEEP_SECONDS': int(os.getenv('POST_DRAIN_SLEEP_SECONDS', 60))
+    'POST_DRAIN_SLEEP_SECONDS': int(os.getenv('POST_DRAIN_SLEEP_SECONDS', 60)),
     'TAINT_NODES': str_to_bool(os.getenv('TAINT_NODES', False)),
     'BATCH_SIZE': int(os.getenv('BATCH_SIZE', 0)),
     'ENFORCED_DRAINING': str_to_bool(os.getenv('ENFORCED_DRAINING', False)),
