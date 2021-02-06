@@ -7,37 +7,50 @@ from .lib.logger import logger
 from .lib.aws import is_asg_scaled, is_asg_healthy, instance_terminated, get_asg_tag, modify_aws_autoscaling, \
     count_all_cluster_instances, save_asg_tags, get_asgs, scale_asg, plan_asgs, terminate_instance_in_asg, delete_asg_tags, plan_asgs_older_nodes
 from .lib.k8s import k8s_nodes_count, k8s_nodes_ready, get_k8s_nodes, modify_k8s_autoscaler, get_node_by_instance_id, \
-    drain_node, delete_node, cordon_node
+    drain_node, delete_node, cordon_node, taint_node
 from .lib.exceptions import RollingUpdateException
 
 
-def validate_cluster_health(asg_name, new_desired_asg_capacity, desired_k8s_node_count, ):
-    cluster_healthy = False
-    # check if asg has enough nodes first before checking instance health
-    if is_asg_scaled(asg_name, new_desired_asg_capacity):
-        # if asg is healthy start draining and terminating instances
-        if is_asg_healthy(asg_name):
-            # check if k8s nodes are all online
-            if k8s_nodes_count(desired_k8s_node_count):
-                # check k8s nodes are healthy
-                if k8s_nodes_ready():
-                    logger.info('Cluster validation passed. Proceeding with node draining and termination...')
-                    cluster_healthy = True
-                else:
-                    logger.info('Validation failed for cluster. Expected node count reached but nodes are not healthy.')
-            else:
-                nodes = get_k8s_nodes()
-                logger.info('Current k8s node count is {}'.format(len(nodes)))
-                logger.info('Validation failed for cluster. Current node count {} Expected node count {}.'.format(
-                    len(nodes),
-                    desired_k8s_node_count))
+def validate_cluster_health(asg_name, new_desired_asg_capacity, cluster_name, predictive, health_check_type="regular",):
+    cluster_health_retry = app_config['CLUSTER_HEALTH_RETRY']
+    cluster_health_wait = app_config['CLUSTER_HEALTH_WAIT']
+    retry_count = 0
+
+    while retry_count < cluster_health_retry:
+        retry_count += 1
+        if health_check_type == "asg":
+            logger.info(f'Waiting for {cluster_health_wait} seconds for ASG to scale before validating cluster health...')
         else:
-            logger.info(
-                'Validation failed for asg {}.'
-                'Instances not healthy'.format(asg_name))
-    else:
-        logger.info('Validation failed for asg {}. Not enough instances online.'.format(asg_name))
-    return cluster_healthy
+            logger.info(f'Waiting for {cluster_health_wait} seconds before validating cluster health...')
+
+        time.sleep(cluster_health_wait)
+
+        # check if asg has enough nodes first before checking instance health
+        if not is_asg_scaled(asg_name, new_desired_asg_capacity):
+            logger.info(f'Validation failed for asg {asg_name}. Not enough instances online.')
+            continue
+
+        # wait and check for instances in ASG to become healthy
+        if not is_asg_healthy(asg_name):
+            logger.info(f'Validation failed for asg {asg_name}. Some instances not yet healthy.')
+            continue
+
+        # wait and check for desired amount of k8s nodes to come online within the cluster
+        desired_k8s_node_count = count_all_cluster_instances(cluster_name, predictive=predictive)
+        if not k8s_nodes_count(desired_k8s_node_count):
+            logger.info(f'Validation failed for cluster {cluster_name}. Didn\'t reach expected node count {desired_k8s_node_count}.')
+            continue
+
+        # Wait and check for nodes to become ready
+        if not k8s_nodes_ready():
+            logger.info('Validation failed for cluster. Expected node count reached but nodes are not ready.')
+            continue
+
+        logger.info('Cluster validation passed. Proceeding with node draining and termination...')
+        return
+
+    logger.info(f'Exiting since ASG healthcheck failed after {cluster_health_retry} attempts')
+    raise Exception('ASG healthcheck failed')
 
 
 def scale_up_asg(cluster_name, asg, count):
@@ -46,11 +59,14 @@ def scale_up_asg(cluster_name, asg, count):
     desired_capacity = asg_old_desired_capacity + count
     asg_tags = asg['Tags']
     asg_name = asg['AutoScalingGroupName']
+    current_capacity = None
 
     # remove any stale suspensions from asg that may be present
     modify_aws_autoscaling(asg_name, "resume")
 
     use_asg_termination_policy = app_config['ASG_USE_TERMINATION_POLICY']
+    batch_size = app_config['BATCH_SIZE']
+
     asg_tag_desired_capacity = get_asg_tag(asg_tags, app_config["ASG_DESIRED_STATE_TAG"])
     asg_tag_orig_capacity = get_asg_tag(asg_tags, app_config["ASG_ORIG_CAPACITY_TAG"])
     asg_tag_orig_max_capacity = get_asg_tag(asg_tags, app_config["ASG_ORIG_MAX_CAPACITY_TAG"])
@@ -77,16 +93,13 @@ def scale_up_asg(cluster_name, asg, count):
         logger.info('Found previous desired capacity value tag set on asg from a previous run.')
         logger.info(f'Maintaining previous capacity of {asg_old_desired_capacity} to not overscale.')
 
-        asg_instance_count = count_all_cluster_instances(cluster_name, predictive=predictive)
-
         # check cluster health before doing anything
-        if not validate_cluster_health(
+        validate_cluster_health(
             asg_name,
             int(asg_tag_desired_capacity.get('Value')),
-            asg_instance_count
-        ):
-            logger.info('Exiting since ASG healthcheck failed')
-            raise Exception('ASG healthcheck failed')
+            cluster_name,
+            predictive
+        )
 
         return int(asg_tag_desired_capacity.get('Value')), int(asg_tag_orig_capacity.get(
             'Value')), int(asg_tag_orig_max_capacity.get('Value'))
@@ -96,27 +109,38 @@ def scale_up_asg(cluster_name, asg, count):
         save_asg_tags(asg_name, app_config["ASG_DESIRED_STATE_TAG"], desired_capacity)
         save_asg_tags(asg_name, app_config["ASG_ORIG_MAX_CAPACITY_TAG"], asg_old_max_size)
 
-        # only change the max size if the new capacity is bigger than current max
-        if desired_capacity > asg_old_max_size:
-            scale_asg(asg_name, asg_old_desired_capacity, desired_capacity, desired_capacity)
-        else:
-            scale_asg(asg_name, asg_old_desired_capacity, desired_capacity, asg_old_max_size)
+        old_desired_capacity = asg_old_desired_capacity
 
-        cluster_health_wait = app_config['CLUSTER_HEALTH_WAIT']
-        logger.info(f'Waiting for {cluster_health_wait} seconds for ASG to scale before validating cluster health...')
-        time.sleep(cluster_health_wait)
-        asg_instance_count = count_all_cluster_instances(cluster_name, predictive=predictive)
+        while True:
+            if batch_size:
+                if current_capacity is None:
+                    current_capacity = old_desired_capacity
+                else:
+                    old_desired_capacity = current_capacity
+                current_capacity += batch_size
+                if current_capacity >= desired_capacity:
+                    current_capacity = desired_capacity
+            else:
+                current_capacity = desired_capacity
 
-        # check cluster health before doing anything
-        if not validate_cluster_health(
-            asg_name,
-            desired_capacity,
-            asg_instance_count
-        ):
-            logger.info('Exiting since ASG healthcheck failed')
-            raise Exception('ASG healthcheck failed')
+            # only change the max size if the new capacity is bigger than current max
+            if current_capacity > asg_old_max_size:
+                scale_asg(asg_name, old_desired_capacity, current_capacity, current_capacity)
+            else:
+                scale_asg(asg_name, old_desired_capacity, current_capacity, asg_old_max_size)
 
-        return desired_capacity, asg_old_desired_capacity, asg_old_max_size
+            # check cluster health before doing anything
+            validate_cluster_health(
+                asg_name,
+                current_capacity,
+                cluster_name,
+                predictive,
+                health_check_type="asg"
+            )
+            if current_capacity == desired_capacity:
+                break
+    logger.info('Proceeding with node draining and termination...')
+    return desired_capacity, asg_old_desired_capacity, asg_old_max_size
 
 
 def update_asgs(asgs, cluster_name):
@@ -149,10 +173,13 @@ def update_asgs(asgs, cluster_name):
                 try:
                     # get the k8s node name instead of instance id
                     node_name = get_node_by_instance_id(k8s_nodes, outdated['InstanceId'])
-                    cordon_node(node_name)
-                except Exception as cordon_exception:
-                    logger.error(f"Encountered an error when cordoning node {node_name}")
-                    logger.error(cordon_exception)
+                    if not app_config["TAINT_NODES"]:
+                        cordon_node(node_name)
+                    else:
+                        taint_node(node_name)
+                except Exception as exception:
+                    logger.error(f"Encountered an error when adding taint/cordoning node {node_name}")
+                    logger.error(exception)
                     exit(1)
 
     # Drain, Delete and Terminate the outdated nodes and return the ASGs back to their original state
@@ -171,10 +198,13 @@ def update_asgs(asgs, cluster_name):
                 try:
                     # get the k8s node name instead of instance id
                     node_name = get_node_by_instance_id(k8s_nodes, outdated['InstanceId'])
-                    cordon_node(node_name)
-                except Exception as cordon_exception:
-                    logger.error(f"Encountered an error when cordoning node {node_name}")
-                    logger.error(cordon_exception)
+                    if not app_config["TAINT_NODES"]:
+                        cordon_node(node_name)
+                    else:
+                        taint_node(node_name)
+                except Exception as exception:
+                    logger.error(f"Encountered an error when adding taint/cordoning node {node_name}")
+                    logger.error(exception)
                     exit(1)
 
         if len(outdated_instances) != 0:

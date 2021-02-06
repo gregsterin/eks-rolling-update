@@ -9,9 +9,17 @@ client = boto3.client('autoscaling')
 ec2_client = boto3.client('ec2')
 
 
-def get_asgs(cluster_tag):
+def get_all_asgs(cluster_tag):
     """
     Queries AWS and returns all ASG's matching kubernetes.io/cluster/<cluster_tag> = owned
+    """
+    return get_asgs(cluster_tag, [])
+
+
+def get_asgs(cluster_tag, asg_names=app_config['ASG_NAMES']):
+    """
+    Queries AWS and find ASG's matching kubernetes.io/cluster/<cluster_tag> = owned
+    If asg_names is not empty, returns only asgs that are inside that list, else return all above asgs
     """
     logger.info('Describing autoscaling groups...')
     paginator = client.get_paginator('describe_auto_scaling_groups')
@@ -21,6 +29,13 @@ def get_asgs(cluster_tag):
     asg_query = "AutoScalingGroups[] | [?contains(Tags[?Key==`kubernetes.io/cluster/{}`].Value, `owned`)]".format(cluster_tag)
     # filter for only asgs with kube cluster tags
     filtered_asgs = page_iterator.search(asg_query)
+    if asg_names:
+        # select only asgs provided in asg_names
+        specific_asgs = []
+        for asg in filtered_asgs:
+            if asg['AutoScalingGroupName'] in asg_names:
+                specific_asgs.append(asg)
+        filtered_asgs = specific_asgs
     return filtered_asgs
 
 
@@ -288,9 +303,11 @@ def instance_outdated_age(instance_id, days_fresh):
         return False
 
 
-def instance_terminated(instance_id, max_retry=app_config['GLOBAL_MAX_RETRY'], wait=app_config['GLOBAL_HEALTH_WAIT']):
+def instance_terminated(instance_id, max_retry=app_config['GLOBAL_MAX_RETRY'], wait=app_config['GLOBAL_HEALTH_WAIT'],
+                        wait_for_stopping=app_config['INSTANCE_WAIT_FOR_STOPPING']):
     """
     Checks that an ec2 instance is terminated or stopped given an InstanceID
+    Overridable to detect shutting-down or stopped states
     """
     retry_count = 1
     is_instance_terminated = False
@@ -302,13 +319,16 @@ def instance_terminated(instance_id, max_retry=app_config['GLOBAL_MAX_RETRY'], w
         )
         state = response['Reservations'][0]['Instances'][0]['State']
         stop_states = ['terminated', 'stopped']
-        if state['Name'] not in stop_states:
-            is_instance_terminated = False
-            logger.info('Instance {} is still running, checking again...'.format(instance_id))
-        else:
-            logger.info('Instance {} terminated!'.format(instance_id))
+        stopping_states = ['shutting-down', 'stopping']
+
+        if state['Name'] in stop_states or (wait_for_stopping and state['Name'] in stopping_states):
+            logger.info('Instance {} {}!'.format(instance_id, state['Name']))
             is_instance_terminated = True
             break
+        else:
+            is_instance_terminated = False
+            logger.info('Instance {} is {}, checking again...'.format(instance_id, state['Name']))
+
         time.sleep(wait)
     return is_instance_terminated
 
@@ -401,7 +421,7 @@ def count_all_cluster_instances(cluster_name, predictive=False):
     Returns the total number of ec2 instances in a k8s cluster
     """
     count = 0
-    asgs = get_asgs(cluster_name)
+    asgs = get_all_asgs(cluster_name)
     for asg in asgs:
         if predictive:
             count += asg['DesiredCapacity']

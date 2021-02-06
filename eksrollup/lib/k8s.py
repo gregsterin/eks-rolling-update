@@ -1,5 +1,6 @@
 from kubernetes import client, config
 from kubernetes.client.rest import ApiException
+import os
 import subprocess
 import time
 import sys
@@ -7,26 +8,36 @@ from .logger import logger
 from eksrollup.config import app_config
 
 
-def get_k8s_nodes(exclude_node_label_key=app_config["EXCLUDE_NODE_LABEL_KEY"]):
-    """
-    Returns a list of kubernetes nodes
-    """
-
+def ensure_config_loaded():
     try:
         config.load_incluster_config()
     except config.ConfigException:
         try:
-            config.load_kube_config()
+            config.load_kube_config(context=app_config['K8S_CONTEXT'])
         except config.ConfigException:
             raise Exception("Could not configure kubernetes python client")
+
+    proxy_url = os.getenv('HTTPS_PROXY', os.getenv('HTTP_PROXY', None))
+    k8s_proxy_bypass = os.getenv('K8S_PROXY_BYPASS')
+
+    if proxy_url and k8s_proxy_bypass != "true":
+        logger.info(f"Setting proxy: {proxy_url}")
+        client.Configuration._default.proxy = proxy_url
+
+
+def get_k8s_nodes(exclude_node_label_keys=app_config["EXCLUDE_NODE_LABEL_KEYS"]):
+    """
+    Returns a list of kubernetes nodes
+    """
+    ensure_config_loaded()
 
     k8s_api = client.CoreV1Api()
     logger.info("Getting k8s nodes...")
     response = k8s_api.list_node()
-    if exclude_node_label_key is not None:
+    if exclude_node_label_keys is not None:
         nodes = []
         for node in response.items:
-            if exclude_node_label_key not in node.metadata.labels:
+            if all(key not in node.metadata.labels for key in exclude_node_label_keys):
                 nodes.append(node)
         response.items = nodes
     logger.info("Current k8s node count is {}".format(len(response.items)))
@@ -55,18 +66,11 @@ def modify_k8s_autoscaler(action):
     Pauses or resumes the Kubernetes autoscaler
     """
 
-    try:
-        config.load_incluster_config()
-    except config.ConfigException:
-        try:
-            config.load_kube_config()
-        except config.ConfigException:
-            raise Exception("Could not configure kubernetes python client")
+    ensure_config_loaded()
 
     # Configure API key authorization: BearerToken
-    configuration = client.Configuration()
     # create an instance of the API class
-    k8s_api = client.AppsV1Api(client.ApiClient(configuration))
+    k8s_api = client.AppsV1Api()
     if action == 'pause':
         logger.info('Pausing k8s autoscaler...')
         body = {'spec': {'replicas': 0}}
@@ -93,17 +97,10 @@ def delete_node(node_name):
     Deletes a kubernetes node from the cluster
     """
 
-    try:
-        config.load_incluster_config()
-    except config.ConfigException:
-        try:
-            config.load_kube_config()
-        except config.ConfigException:
-            raise Exception("Could not configure kubernetes python client")
+    ensure_config_loaded()
 
-    configuration = client.Configuration()
     # create an instance of the API class
-    k8s_api = client.CoreV1Api(client.ApiClient(configuration))
+    k8s_api = client.CoreV1Api()
     logger.info("Deleting k8s node {}...".format(node_name))
     try:
         if not app_config['DRY_RUN']:
@@ -120,17 +117,10 @@ def cordon_node(node_name):
     Cordon a kubernetes node to avoid new pods being scheduled on it
     """
 
-    try:
-        config.load_incluster_config()
-    except config.ConfigException:
-        try:
-            config.load_kube_config()
-        except config.ConfigException:
-            raise Exception("Could not configure kubernetes python client")
+    ensure_config_loaded()
 
-    configuration = client.Configuration()
     # create an instance of the API class
-    k8s_api = client.CoreV1Api(client.ApiClient(configuration))
+    k8s_api = client.CoreV1Api()
     logger.info("Cordoning k8s node {}...".format(node_name))
     try:
         api_call_body = client.V1Node(spec=client.V1NodeSpec(unschedulable=True))
@@ -139,6 +129,27 @@ def cordon_node(node_name):
         else:
             k8s_api.patch_node(node_name, api_call_body, dry_run=True)
         logger.info("Node cordoned")
+    except ApiException as e:
+        logger.info("Exception when calling CoreV1Api->patch_node: {}".format(e))
+
+
+def taint_node(node_name):
+    """
+    Taint a kubernetes node to avoid new pods being scheduled on it
+    """
+
+    ensure_config_loaded()
+
+    k8s_api = client.CoreV1Api()
+    logger.info("Adding taint to k8s node {}...".format(node_name))
+    try:
+        taint = client.V1Taint(effect='NoSchedule', key='eks-rolling-update')
+        api_call_body = client.V1Node(spec=client.V1NodeSpec(taints=[taint]))
+        if not app_config['DRY_RUN']:
+            k8s_api.patch_node(node_name, api_call_body)
+        else:
+            k8s_api.patch_node(node_name, api_call_body, dry_run=True)
+        logger.info("Added taint to the node")
     except ApiException as e:
         logger.info("Exception when calling CoreV1Api->patch_node: {}".format(e))
 
@@ -162,13 +173,22 @@ def drain_node(node_name):
     logger.info('Draining worker node with {}...'.format(' '.join(kubectl_args)))
     result = subprocess.run(kubectl_args)
 
-    # If returncode is non-zero, raise a CalledProcessError.
+    # If returncode is non-zero run enforced draining of the node or raise a CalledProcessError.
     if result.returncode != 0:
-        raise Exception("Node not drained properly. Exiting")
+        if app_config['ENFORCED_DRAINING'] is True:
+            kubectl_args += [
+                '--disable-eviction=true',
+                '--force=true'
+            ]
+            logger.info('There was an error draining the worker node, proceed with enforced draining ({})...'.format(' '.join(kubectl_args)))
+            enforced_result = subprocess.run(kubectl_args)
+            if enforced_result.returncode != 0:
+                raise Exception("Node not drained properly with enforced draining enabled. Exiting")
+        else:
+            raise Exception("Node not drained properly. Exiting")
     sleep_time = app_config['POST_DRAIN_SLEEP_SECONDS']
     logger.info("Sleeping {} seconds after draining node...".format(sleep_time))
     time.sleep(sleep_time)
-
 
 def k8s_nodes_ready(max_retry=app_config['GLOBAL_MAX_RETRY'], wait=app_config['GLOBAL_HEALTH_WAIT']):
     """
